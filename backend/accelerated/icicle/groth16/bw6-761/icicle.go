@@ -272,18 +272,27 @@ func msmChunkedG1(scalars icicle_core.DeviceSlice, bases icicle_core.DeviceSlice
 		return curve.G1Jac{}, 0, nil
 	}
 
-	chunks := configureMSM(&cfg, size, scalars, bases, fr.Bits, unsafe.Sizeof(fr.Element{}), unsafe.Sizeof(curve.G1Affine{}), unsafe.Sizeof(icicle_bw6761.Projective{}))
+	chunks := configureMSM(
+		&cfg,
+		size,
+		scalars,
+		bases,
+		fr.Bits,
+		int(unsafe.Sizeof(fr.Element{})),
+		int(unsafe.Sizeof(icicle_bw6761.Affine{})),
+		int(unsafe.Sizeof(icicle_bw6761.Projective{})),
+	)
 	for {
-		cfgLocal := cfg
+		cg := cfg
 		var ext *icicle_config_extension.ConfigExtension
 		if chunks > 1 {
 			ext = icicle_config_extension.Create()
 			ext.SetInt(icicle_core.CUDA_MSM_NOF_CHUNKS, chunks)
-			cfgLocal.Ext = ext.AsUnsafePointer()
+			cg.Ext = ext.AsUnsafePointer()
 		}
 
 		res := make(icicle_core.HostSlice[icicle_bw6761.Projective], 1)
-		err := icicle_msm.Msm(scalars, bases, &cfgLocal, res)
+		err := icicle_msm.Msm(scalars, bases, &cg, res)
 		if ext != nil {
 			icicle_config_extension.Delete(ext)
 		}
@@ -301,25 +310,33 @@ func msmChunkedG1(scalars icicle_core.DeviceSlice, bases icicle_core.DeviceSlice
 	}
 }
 
-// msmChunkedG2 mirrors msmChunkedG1 for G2 MSMs, preventing GPU OOM while preserving the final accumulator.
 func msmChunkedG2(scalars icicle_core.DeviceSlice, bases icicle_core.DeviceSlice, cfg icicle_core.MSMConfig) (curve.G2Jac, int, error) {
 	size := scalars.Len()
 	if size == 0 {
 		return curve.G2Jac{}, 0, nil
 	}
 
-	chunks := configureMSM(&cfg, size, scalars, bases, fr.Bits, unsafe.Sizeof(fr.Element{}), unsafe.Sizeof(curve.G2Affine{}), unsafe.Sizeof(icicle_g2.G2Projective{}))
+	chunks := configureMSM(
+		&cfg,
+		size,
+		scalars,
+		bases,
+		fr.Bits,
+		int(unsafe.Sizeof(fr.Element{})),
+		int(unsafe.Sizeof(icicle_g2.G2Affine{})),
+		int(unsafe.Sizeof(icicle_g2.G2Projective{})),
+	)
 	for {
-		cfgLocal := cfg
+		cg := cfg
 		var ext *icicle_config_extension.ConfigExtension
 		if chunks > 1 {
 			ext = icicle_config_extension.Create()
 			ext.SetInt(icicle_core.CUDA_MSM_NOF_CHUNKS, chunks)
-			cfgLocal.Ext = ext.AsUnsafePointer()
+			cg.Ext = ext.AsUnsafePointer()
 		}
 
 		res := make(icicle_core.HostSlice[icicle_g2.G2Projective], 1)
-		err := icicle_g2.G2Msm(scalars, bases, &cfgLocal, res)
+		err := icicle_g2.G2Msm(scalars, bases, &cg, res)
 		if ext != nil {
 			icicle_config_extension.Delete(ext)
 		}
@@ -337,7 +354,7 @@ func msmChunkedG2(scalars icicle_core.DeviceSlice, bases icicle_core.DeviceSlice
 	}
 }
 
-func configureMSM(cfg *icicle_core.MSMConfig, msmSize int, scalars, bases icicle_core.DeviceSlice, bitsize int, scalarBytes, affineBytes, projectiveBytes uintptr) int {
+func configureMSM(cfg *icicle_core.MSMConfig, msmSize int, scalars, bases icicle_core.DeviceSlice, bitsize int, scalarFallback, affineFallback, projectiveBytes int) int {
 	if msmSize <= 0 {
 		return 1
 	}
@@ -360,6 +377,19 @@ func configureMSM(cfg *icicle_core.MSMConfig, msmSize int, scalars, bases icicle
 	}
 	if selectedC < 4 {
 		selectedC = 4
+	}
+
+	scalarBytes := scalarFallback
+	if l := scalars.Len(); l > 0 {
+		if sz := scalars.SizeOfElement(); sz > 0 {
+			scalarBytes = sz
+		}
+	}
+	affineBytes := affineFallback
+	if l := bases.Len(); l > 0 {
+		if sz := bases.SizeOfElement(); sz > 0 {
+			affineBytes = sz
+		}
 	}
 
 	precompute := int(cfg.PrecomputeFactor)
@@ -400,7 +430,7 @@ func configureMSM(cfg *icicle_core.MSMConfig, msmSize int, scalars, bases icicle
 		chunkCount = 1
 	}
 
-	capChunks := chunkCountFromCap(msmSize, scalars, bases, freeMem)
+	capChunks := chunkCountFromCap(msmSize, scalarBytes, affineBytes, freeMem)
 	if capChunks > chunkCount {
 		chunkCount = capChunks
 	}
@@ -410,7 +440,7 @@ func configureMSM(cfg *icicle_core.MSMConfig, msmSize int, scalars, bases icicle
 	return chunkCount
 }
 
-func chunkCountFromCap(size int, scalars, bases icicle_core.DeviceSlice, freeMem float64) int {
+func chunkCountFromCap(size int, scalarBytes, baseBytes int, freeMem float64) int {
 	cap := getConfiguredMSMChunkCap()
 	if cap <= 0 {
 		return 1
@@ -442,7 +472,7 @@ func chunkCountFromCap(size int, scalars, bases icicle_core.DeviceSlice, freeMem
 
 func getConfiguredMSMChunkCap() int {
 	msmChunkCapOnce.Do(func() {
-		const defaultCap = 1 << 20
+		const defaultCap = 1 << 20 // 1,048,576 elements (~safe upper bound)
 		cap := defaultCap
 		if val := os.Getenv("ICICLE_MSM_MAX_CHUNK"); val != "" {
 			if parsed, err := strconv.Atoi(val); err == nil && parsed > 0 {
@@ -468,7 +498,7 @@ func getConfiguredMSMMaxWindow() int {
 	return msmMaxWindow
 }
 
-func computeMinMSMChunks(msmSize, bitsize, initialC, precompute, batchSize int, sharedPoints bool, scalarBytes, affineBytes, projectiveBytes uintptr, freeMem float64, scalarsOnDevice, basesOnDevice bool) (int, int, int) {
+func computeMinMSMChunks(msmSize, bitsize, initialC, precompute, batchSize int, sharedPoints bool, scalarBytes, affineBytes, projectiveBytes int, freeMem float64, scalarsOnDevice, basesOnDevice bool) (int, int, int) {
 	if msmSize <= 0 {
 		return 1, initialC, batchSize
 	}
@@ -605,7 +635,7 @@ func computeRequiredMSMMemory(
 	sharedPoints bool,
 	scalarBytes,
 	affineBytes,
-	projectiveBytes uintptr,
+	projectiveBytes int,
 	freeMem float64,
 	scalarsOnDevice,
 	basesOnDevice bool,
