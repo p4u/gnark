@@ -990,83 +990,127 @@ func Prove(r1cs *cs.R1CS, pk *ProvingKey, fullWitness witness.Witness, cfg *icic
 	}
 
 	computeKRS := func() error {
-		log.Debug().Msg("Loading G1.Z for KRS MSM")
-		g1ZHost := (icicle_core.HostSlice[curve.G1Affine])(pk.G1.Z)
-		g1ZDevice, err := loadG1(g1ZHost)
-		if err != nil {
-			return fmt.Errorf("load G1.Z: %w", err)
-		}
-		defer func() {
-			if g1ZDevice.AsUnsafePointer() != nil {
-				g1ZDevice.Free()
-			}
-			log.Debug().Msg("Freed G1.Z after KRS MSM")
-		}()
+		// Concurrent execution of two independent MSMs for improved performance
+		log.Debug().Msg("Starting concurrent KRS MSMs (G1.Z and G1.K)")
 
-		var krs, krs2, p1 curve.G1Jac
+		type msmResult struct {
+			jac    curve.G1Jac
+			chunks int
+			err    error
+		}
+
+		chKrs2Done := make(chan msmResult, 1)
+		chKrsMainDone := make(chan msmResult, 1)
+
 		sizeH := int(pk.Domain.Cardinality - 1)
 
-		cfg := icicle_msm.GetDefaultMSMConfig()
-		start := time.Now()
+		// Goroutine 1: G1.Z MSM (krs2)
+		go func() {
+			icicle_runtime.RunOnDevice(&device, func(args ...any) {
+				log.Debug().Msg("Loading G1.Z for KRS2 MSM")
+				g1ZHost := (icicle_core.HostSlice[curve.G1Affine])(pk.G1.Z)
+				g1ZDevice, err := loadG1(g1ZHost)
+				if err != nil {
+					chKrs2Done <- msmResult{err: fmt.Errorf("load G1.Z: %w", err)}
+					return
+				}
+				defer func() {
+					if g1ZDevice.AsUnsafePointer() != nil {
+						g1ZDevice.Free()
+					}
+					log.Debug().Msg("Freed G1.Z after KRS2 MSM")
+				}()
 
-		jac, chunks, err := msmChunkedG1(h.RangeTo(sizeH, false), g1ZDevice, cfg)
-		if err != nil {
-			return fmt.Errorf("msm Krs2: %w", err)
-		}
-		krs2 = jac
+				cfg := icicle_msm.GetDefaultMSMConfig()
+				start := time.Now()
 
-		if isProfileMode {
-			evt := log.Debug().Dur("took", time.Since(start))
-			if chunks > 1 {
-				evt = evt.Int("chunks", chunks)
-			}
-			evt.Msg("MSM Krs2")
-		}
+				jac, chunks, err := msmChunkedG1(h.RangeTo(sizeH, false), g1ZDevice, cfg)
+				if err != nil {
+					chKrs2Done <- msmResult{err: fmt.Errorf("msm Krs2: %w", err)}
+					return
+				}
 
-		log.Debug().Msg("Loading G1.K for KRS MSM")
-		g1KHost := (icicle_core.HostSlice[curve.G1Affine])(pk.G1.K)
-		g1KDevice, err := loadG1(g1KHost)
-		if err != nil {
-			return fmt.Errorf("load G1.K: %w", err)
-		}
-		defer func() {
-			if g1KDevice.AsUnsafePointer() != nil {
-				g1KDevice.Free()
-			}
-			log.Debug().Msg("Freed G1.K after KRS MSM")
+				if isProfileMode {
+					evt := log.Debug().Dur("took", time.Since(start))
+					if chunks > 1 {
+						evt = evt.Int("chunks", chunks)
+					}
+					evt.Msg("MSM Krs2")
+				}
+
+				chKrs2Done <- msmResult{jac: jac, chunks: chunks, err: nil}
+			})
 		}()
 
-		// filter the wire values if needed
-		// TODO Perf @Tabaie worst memory allocation offender
-		toRemove := commitmentInfo.GetPrivateCommitted()
-		toRemove = append(toRemove, commitmentInfo.CommitmentIndexes())
-		_wireValues := filterHeap(wireValues[r1cs.GetNbPublicVariables():], r1cs.GetNbPublicVariables(), slices.Concat(toRemove...))
-		_wireValuesHost := (icicle_core.HostSlice[fr.Element])(_wireValues)
+		// Goroutine 2: G1.K MSM (krs main)
+		go func() {
+			icicle_runtime.RunOnDevice(&device, func(args ...any) {
+				// filter the wire values if needed
+				// TODO Perf @Tabaie worst memory allocation offender
+				toRemove := commitmentInfo.GetPrivateCommitted()
+				toRemove = append(toRemove, commitmentInfo.CommitmentIndexes())
+				_wireValues := filterHeap(wireValues[r1cs.GetNbPublicVariables():], r1cs.GetNbPublicVariables(), slices.Concat(toRemove...))
+				_wireValuesHost := (icicle_core.HostSlice[fr.Element])(_wireValues)
 
-		// Copy to device to allow Go-side chunking
-		var _wireValuesDevice icicle_core.DeviceSlice
-		_wireValuesHost.CopyToDevice(&_wireValuesDevice, true)
-		defer _wireValuesDevice.Free()
+				// Copy to device to allow Go-side chunking
+				var _wireValuesDevice icicle_core.DeviceSlice
+				_wireValuesHost.CopyToDevice(&_wireValuesDevice, true)
+				defer _wireValuesDevice.Free()
 
-		cfg.AreScalarsMontgomeryForm = true
-		start = time.Now()
+				log.Debug().Msg("Loading G1.K for KRS main MSM")
+				g1KHost := (icicle_core.HostSlice[curve.G1Affine])(pk.G1.K)
+				g1KDevice, err := loadG1(g1KHost)
+				if err != nil {
+					chKrsMainDone <- msmResult{err: fmt.Errorf("load G1.K: %w", err)}
+					return
+				}
+				defer func() {
+					if g1KDevice.AsUnsafePointer() != nil {
+						g1KDevice.Free()
+					}
+					log.Debug().Msg("Freed G1.K after KRS main MSM")
+				}()
 
-		jac, chunks, err = msmChunkedG1(_wireValuesDevice, g1KDevice, cfg)
-		if err != nil {
-			return fmt.Errorf("msm Krs: %w", err)
+				cfg := icicle_msm.GetDefaultMSMConfig()
+				cfg.AreScalarsMontgomeryForm = true
+				start := time.Now()
+
+				jac, chunks, err := msmChunkedG1(_wireValuesDevice, g1KDevice, cfg)
+				if err != nil {
+					chKrsMainDone <- msmResult{err: fmt.Errorf("msm Krs: %w", err)}
+					return
+				}
+
+				if isProfileMode {
+					evt := log.Debug().Dur("took", time.Since(start))
+					if chunks > 1 {
+						evt = evt.Int("chunks", chunks)
+					}
+					evt.Msg("MSM Krs")
+				}
+
+				chKrsMainDone <- msmResult{jac: jac, chunks: chunks, err: nil}
+			})
+		}()
+
+		// Wait for both MSMs to complete
+		res2 := <-chKrs2Done
+		if res2.err != nil {
+			return res2.err
 		}
-		krs = jac
+		krs2 := res2.jac
 
-		if isProfileMode {
-			evt := log.Debug().Dur("took", time.Since(start))
-			if chunks > 1 {
-				evt = evt.Int("chunks", chunks)
-			}
-			evt.Msg("MSM Krs")
+		resMain := <-chKrsMainDone
+		if resMain.err != nil {
+			return resMain.err
 		}
+		krs := resMain.jac
 
+		log.Debug().Msg("Concurrent KRS MSMs completed successfully")
+
+		// Combine results
+		var p1 curve.G1Jac
 		krs.AddMixed(&deltas[2])
-
 		krs.AddAssign(&krs2)
 
 		p1.ScalarMultiplication(&ar, &s)
