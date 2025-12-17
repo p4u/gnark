@@ -1147,12 +1147,36 @@ func Prove(r1cs *cs.R1CS, pk *ProvingKey, fullWitness witness.Witness, cfg *icic
 		<-chWireValuesA
 		<-chWireValuesB
 
-		if err := computeAR1(); err != nil {
-			panic(fmt.Sprintf("compute AR1: %v", err))
+		// Concurrent AR1 + BS1 execution for improved performance
+		// These operations are independent and can run in parallel
+		log.Debug().Msg("Starting concurrent AR1+BS1 MSMs")
+		
+		chAr1Done := make(chan error, 1)
+		chBs1Done := make(chan error, 1)
+		
+		go func() {
+			icicle_runtime.RunOnDevice(&device, func(args ...any) {
+				chAr1Done <- computeAR1()
+			})
+		}()
+		
+		go func() {
+			icicle_runtime.RunOnDevice(&device, func(args ...any) {
+				chBs1Done <- computeBS1()
+			})
+		}()
+		
+		// Wait for both to complete
+		if err := <-chAr1Done; err != nil {
+			panic(fmt.Sprintf("concurrent AR1: %v", err))
 		}
-		if err := computeBS1(); err != nil {
-			panic(fmt.Sprintf("compute BS1: %v", err))
+		if err := <-chBs1Done; err != nil {
+			panic(fmt.Sprintf("concurrent BS1: %v", err))
 		}
+		
+		log.Debug().Msg("Concurrent AR1+BS1 completed successfully")
+		
+		// Sequential execution for dependent operations (BS2 and KRS depend on AR1/BS1 results)
 		if err := computeBS2(); err != nil {
 			panic(fmt.Sprintf("compute BS2: %v", err))
 		}
